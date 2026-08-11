@@ -91,6 +91,7 @@ class LPLBSolver:
         num_gpus: int,
         ep_group=None,
         logical_to_all_physical_map_num_valid=None,
+        solver_backend: str = "ipm",
     ):
         """
         Args:
@@ -103,6 +104,9 @@ class LPLBSolver:
         device = phy2log.device
         self.num_gpus = num_gpus
         self.ep_group = ep_group
+        self.solver_backend = solver_backend
+        if solver_backend not in {"ipm", "edge-balance", "hyperedge-water-filling"}:
+            raise ValueError(f"unknown LPLB solver backend: {solver_backend}")
         self._has_redundancy = False
         if logical_to_all_physical_map_num_valid is not None:
             self._has_redundancy = bool(
@@ -185,9 +189,10 @@ class LPLBSolver:
         # real request. No-op when the fused backend is unavailable.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
+        if solver_backend == "ipm":
+            from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
 
-        _ipm_warmup(nc, nv, num_iters=5, device=device)
+            _ipm_warmup(nc, nv, num_iters=5, device=device)
 
         # Pre-compute A_base row sum (used in every prep call).
         self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
@@ -205,6 +210,41 @@ class LPLBSolver:
         self._log2phy_prob = torch.empty(
             log2phy.shape, dtype=torch.float32, device=device
         )
+
+        if solver_backend != "ipm":
+            from sglang.kernels.ops.lplb.topology import (
+                build_colored_replica_topology,
+            )
+
+            if not self._has_redundancy:
+                raise ValueError(f"{solver_backend} requires replicated experts")
+            self._graph_topology = build_colored_replica_topology(
+                self.log2phy,
+                self.log_replicated,
+                self.num_phy,
+                self.num_gpus,
+                require_pairs=solver_backend == "edge-balance",
+            )
+            self._graph_replicated_logical = self.log_replicated.to(
+                torch.int32
+            ).contiguous()
+            # Rank for each single-copy logical expert; replicated experts are
+            # marked -1 and initialized by the graph solver.
+            per_gpu = self.num_phy // self.num_gpus
+            self._logical_rank = torch.full(
+                (self.num_logical,), -1, dtype=torch.int32, device=device
+            )
+            self._logical_rank[self.log_single] = (self.phy_single // per_gpu).to(
+                torch.int32
+            )
+            self._graph_sweeps = torch.empty(1, dtype=torch.int32, device=device)
+            self._graph_max_load = torch.empty(1, dtype=torch.float32, device=device)
+            # Compile the shape-specialized graph kernel at startup, matching
+            # the IPM backend's warmup contract. The first layer pays the JIT
+            # cost; subsequent layers with the same shape reuse the module.
+            self._solve(
+                torch.zeros(self.num_logical, dtype=torch.float32, device=device)
+            )
 
     def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -262,6 +302,24 @@ class LPLBSolver:
         Raises if the JIT CUDA backend is unavailable.
         """
         from sglang.kernels.ops.lplb import cuda_solver
+
+        if self.solver_backend != "ipm":
+            topology = self._graph_topology
+            return cuda_solver.solve_graph_lplb(
+                self._log2phy_prob,
+                global_counts,
+                self._logical_rank,
+                self._graph_replicated_logical,
+                topology.eligible_ranks,
+                topology.valid_copies,
+                topology.colored_experts,
+                topology.color_offsets,
+                topology.num_colors,
+                num_gpus=self.num_gpus,
+                waterfill=self.solver_backend == "hyperedge-water-filling",
+                out_sweeps=self._graph_sweeps,
+                out_max_load=self._graph_max_load,
+            )
 
         cuda_solver.prep_lp_inputs(
             self._A_full,

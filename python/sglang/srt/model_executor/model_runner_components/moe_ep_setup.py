@@ -77,6 +77,7 @@ def prepare_moe_topk(
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.distributed import get_moe_ep_group
+    from sglang.srt.runtime_context import get_exec
 
     # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
     # don't participate in the EP all-reduce (would deadlock under DP-
@@ -90,6 +91,8 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
         return
     clear_global_lplb_solvers()
     ep_group = get_moe_ep_group()
+    moe_config = get_exec().moe
+    solver_backend = getattr(moe_config, "lplb_solver", "ipm")
     for lid in range(metadata.num_layers):
         solver = LPLBSolver(
             phy2log=metadata.physical_to_logical_map[lid],
@@ -99,9 +102,14 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
             logical_to_all_physical_map_num_valid=(
                 metadata.logical_to_all_physical_map_num_valid[lid]
             ),
+            solver_backend=solver_backend,
         )
         set_global_lplb_solver(lid, solver)
-    logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
+    logger.info(
+        "Initialized %s LPLB solvers for %s layers",
+        solver_backend,
+        metadata.num_layers,
+    )
 
 
 def check_quantized_moe_compatibility(

@@ -41,6 +41,61 @@ def _sm_ver() -> int:
 
 
 @cache_once
+def _graph_module(
+    num_gpus: int,
+    num_logical: int,
+    num_replicated: int,
+    copies: int,
+    waterfill: bool,
+) -> Module:
+    args = make_cpp_args(num_gpus, num_logical, num_replicated, copies, waterfill)
+    name = "lplb_hyperedge_water_filling" if waterfill else "lplb_edge_balance"
+    return load_jit(
+        name,
+        *args,
+        cuda_files=["lplb/graph_solvers.cuh"],
+        cuda_wrappers=[("solve", f"graph_lplb<{args}>")],
+    )
+
+
+def solve_graph_lplb(
+    probability: torch.Tensor,
+    counts: torch.Tensor,
+    logical_rank: torch.Tensor,
+    replicated_logical: torch.Tensor,
+    eligible_ranks: torch.Tensor,
+    valid_copies: torch.Tensor,
+    colored_experts: torch.Tensor,
+    color_offsets: torch.Tensor,
+    num_colors: int,
+    *,
+    num_gpus: int,
+    waterfill: bool,
+    out_sweeps: torch.Tensor,
+    out_max_load: torch.Tensor,
+) -> torch.Tensor:
+    """Run five Edge Balance or Hyperedge Water-Filling sweeps in one warp."""
+    num_logical, copies = probability.shape
+    module = _graph_module(
+        num_gpus, num_logical, replicated_logical.numel(), copies, waterfill
+    )
+    module.solve(
+        probability,
+        counts,
+        logical_rank,
+        replicated_logical,
+        eligible_ranks,
+        valid_copies,
+        colored_experts,
+        color_offsets,
+        num_colors,
+        out_sweeps,
+        out_max_load,
+    )
+    return probability
+
+
+@cache_once
 def _ipm_module(
     nc: int, nv: int, block_dim: int, num_iters: int, sm_ver: int
 ) -> Module:

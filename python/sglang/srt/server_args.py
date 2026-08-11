@@ -2337,6 +2337,11 @@ class ServerArgs:
         "The algorithm to choose ranks for redundant experts in expert parallel.",
         NS("exec.moe"),
     ] = None
+    lplb_solver: A[
+        Literal["ipm", "edge-balance", "hyperedge-water-filling"],
+        "CUDA optimization backend used by --ep-dispatch-algorithm lp.",
+        NS("exec.moe"),
+    ] = "ipm"
     init_expert_location: A[str, "Initial location of EP experts.", NS("exec.moe")] = (
         "trivial"
     )
